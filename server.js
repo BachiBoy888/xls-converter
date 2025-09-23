@@ -30,7 +30,9 @@ const upload = multer({
 });
 
 // --- health & version ---
-app.get("/healthz", (req, res) => res.status(200).send("ok"));
+app.get("/healthz", (req, res) => {
+  res.status(200).send("ok-v2");
+});
 app.get("/version", (req, res) => res.json({ version: process.env.VERSION || "dev" }));
 
 // --- главный эндпоинт: XLS/XLSX -> XLSX ---
