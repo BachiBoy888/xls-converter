@@ -30,8 +30,8 @@ const upload = multer({
 });
 
 // --- health & version ---
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-app.get("/version", (_req, res) => res.json({ version: process.env.VERSION || "dev" }));
+app.get("/healthz", (req, res) => res.status(200).send("ok"));
+app.get("/version", (req, res) => res.json({ version: process.env.VERSION || "dev" }));
 
 // --- главный эндпоинт: XLS/XLSX -> XLSX ---
 app.post("/convert/xlsx", upload.single("file"), (req, res) => {
@@ -60,6 +60,41 @@ app.post("/convert/xlsx", upload.single("file"), (req, res) => {
     return res.status(500).json({ error: "Failed to convert to XLSX. Make sure the file is a valid .xls/.xlsx." });
   }
 });
+
+// === /api/statement/parse (stub) ===
+
+const uploadXlsOnly = multer({
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: (req, file, cb) => {
+    const name = (file.originalname || "").toLowerCase();
+    if (!name.endsWith(".xls")) return cb(new Error("ONLY_XLS_ALLOWED"));
+    cb(null, true);
+  },
+});
+
+app.post("/api/statement/parse", uploadXlsOnly.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "NO_FILE" });
+
+    // Проверим, что файл читается как Excel
+    XLSX.read(req.file.buffer, { type: "buffer" });
+
+    // Возвращаем минимальный контракт-заглушку
+      return res.json({
+            period: { from: null, to: null },
+            dailySpending: [],
+            transactions: [],
+            totals: { spending: 0 },
+          });
+  } catch (e) {
+     if (e?.message === "ONLY_XLS_ALLOWED") {
+       return res.status(415).json({ error: "ONLY_XLS_ALLOWED" });
+     }
+     console.error(e);
+     return res.status(500).json({ error: "PARSE_FAILED" });
+   }
+ });
+
 
 // 404
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
