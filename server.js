@@ -81,6 +81,29 @@ app.post("/api/statement/parse", uploadXlsOnly.single("file"), async (req, res) 
     // Проверим, что файл читается как Excel
     XLSX.read(req.file.buffer, { type: "buffer" });
 
+      const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+      const sheetName = wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+
+      // ВКЛЮЧАЕМ DEBUG по query-параметру ?debug=1
+      const isDebug = String(req.query?.debug || "") === "1";
+
+      // Читаем как объекты (по заголовкам) и как массив массивов (сырая таблица)
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      const aoa  = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+      if (isDebug) {
+        // вернём диагностическую инфу, чтобы понять, почему пусто
+        return res.json({
+          sheetNames: wb.SheetNames,
+          firstSheet: sheetName,
+          rowsLen: rows.length,
+          headerRow: aoa[0] || [],
+          sampleRowObj: rows[0] || null,
+          sampleRowAoa: aoa[1] || null
+        });
+      }
+      
     // Возвращаем минимальный контракт-заглушку
       return res.json({
             period: { from: null, to: null },
