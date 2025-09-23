@@ -227,7 +227,19 @@ app.post("/api/statement/parse", uploadXlsOnly.single("file"), async (req, res) 
   }
 });
 
-
+// --- error handler для multer и наших ошибок ---
+app.use((err, req, res, next) => {
+  // наш маркер из fileFilter: строго .xls
+  if (err && err.message === "ONLY_XLS_ALLOWED") {
+    return res.status(415).json({ error: "ONLY_XLS_ALLOWED" });
+  }
+  // ошибки multer (размер, поле и т.п.)
+  if (err && err instanceof multer.MulterError) {
+    return res.status(400).json({ error: "UPLOAD_ERROR", code: err.code });
+  }
+  // прокинем дальше — на случай других ошибок
+  return next(err);
+});
 
 // 404
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
