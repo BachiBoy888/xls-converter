@@ -86,37 +86,49 @@ function parseKgsNumber(val) {
   if (commaAsDecimal) s = s.replace(/\./g, "").replace(",", ".");
   return Number(s);
 }
+
 function tryParseDate(d) {
   if (!d) return null;
   if (d instanceof Date && !isNaN(d)) return d;
   const s = String(d).trim();
 
-  const n = Number(s); // Excel serial?
+  // Excel serial?
+  const n = Number(s);
   if (!isNaN(n) && n > 25569 && n < 60000) {
     const epoch = new Date(Date.UTC(1899, 11, 30));
     return new Date(epoch.getTime() + n * 86400000);
   }
-  const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})/); // dd.mm.yyyy
+
+  // dd.mm.yyyy
+  const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})/);
   if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
-  const m2 = s.match(/^(\d{4})-(\d{2})-(\d{2})/); // yyyy-mm-dd
+
+  // yyyy-mm-dd
+  const m2 = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m2) return new Date(Number(m2[1]), Number(m2[2]) - 1, Number(m2[3]));
 
   const dt = new Date(s);
   return isNaN(dt) ? null : dt;
 }
+
 function ymd(dt) {
   const y = dt.getFullYear();
   const m = String(dt.getMonth() + 1).padStart(2, "0");
   const d = String(dt.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
+
 const COLS = {
-  date: ["Дата", "Дата операции", "Operation date", "Posting date", "Дата проводки"],
-  desc: ["Описание", "Описание операции", "Description", "Назначение платежа", "Назначение"],
+  date: ["Дата", "Дата операции", "Operation date", "Posting date", "Дата проводки", "Date"],
+  desc: [
+    "Operation", "Recipient/Payer",       // MBank столбцы
+    "Описание", "Описание операции", "Description", "Назначение платежа", "Назначение"
+  ],
   debit: ["Списание", "Дебет", "Расход", "Debit"],
   credit: ["Поступление", "Кредит", "Доход", "Credit"],
   amount: ["Сумма", "Amount", "Итого"],
 };
+
 function pick(row, keys) {
   const map = Object.fromEntries(Object.keys(row).map(k => [k.toLowerCase().trim(), k]));
   for (const k of keys) {
@@ -126,6 +138,7 @@ function pick(row, keys) {
   return undefined;
 }
 // === end helpers ===
+
 
 
 app.post("/api/statement/parse", uploadXlsOnly.single("file"), async (req, res) => {
