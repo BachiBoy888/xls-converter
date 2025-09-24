@@ -1,34 +1,62 @@
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import XLSX from "xlsx";
-import morgan from "morgan";
-import rateLimit from "express-rate-limit";
-
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import XLSX from 'xlsx';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
+import { DateTime } from 'luxon';
+import { v4 as uuidv4 } from 'uuid';
+import fs from 'fs/promises';
+import os from 'os';
+import helmet from 'helmet';
 
 
 const app = express();
+app.use(helmet({ crossOriginResourcePolicy: false }));
 
-// --- базовые мидлвары ---
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+// CORS: либо из ENV, либо '*'
+const allowed = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors(allowed.length ? {
+  origin: allowed,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-api-token'],
+  maxAge: 600
+} : {
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-api-token'],
+  maxAge: 600
+}));
+app.options('*', cors());
 
-const allowed = (process.env.CORS_ORIGINS || "").split(",").filter(Boolean);
-app.use(cors(allowed.length ? { origin: allowed } : undefined));
+app.set('trust proxy', 1); // чтобы rateLimit видел реальный IP
+
+
+// === requestId + таймер (ставим ДО morgan/rateLimit) ===
+app.use((req, res, next) => {
+  req.id = uuidv4();
+  req._startMs = Date.now();
+  next();
+});
+
+// morgan с requestId
+morgan.token('rid', req => req.id);
+app.use(morgan((process.env.NODE_ENV === 'production' ? 'combined' : 'dev') + ' :rid'));
 
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 60 })); // 60 запросов / 15 мин
 
-// простая авторизация по токену (по желанию)
+// === опциональная авторизация по токену ===
 app.use((req, res, next) => {
   const expected = process.env.API_TOKEN;
   if (!expected) return next();
-  if (req.header("x-api-token") === expected) return next();
-  return res.status(401).json({ error: "Unauthorized" });
+  if (req.header('x-api-token') === expected) return next();
+  return res.status(401).json({ error: 'Unauthorized', requestId: req.id });
 });
 
 // --- загрузка файлов в память ---
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: (process.env.MAX_FILE_SIZE_MB ? +process.env.MAX_FILE_SIZE_MB : 10) * 1024 * 1024 }
+    storage: multer.memoryStorage(),
+      limits: { fileSize: 20 * 1024 * 1024 } // 20 MB
 });
 
 // --- health & version ---
@@ -39,39 +67,45 @@ app.get("/version", (req, res) => res.json({ version: process.env.VERSION || "de
 
 // --- главный эндпоинт: XLS/XLSX -> XLSX ---
 app.post("/convert/xlsx", upload.single("file"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "Attach file field name 'file'." });
+    const rid = req.id;
+      const started = Date.now();
+      try {
+        if (!req.file) return res.status(400).json({ error: "NO_FILE", requestId: rid });
 
-    // Разрешаем только .xls/.xlsx
-    const name = (req.file.originalname || "").toLowerCase();
-    if (!/\.(xls|xlsx)$/.test(name)) {
-      return res.status(400).json({ error: "Only .xls or .xlsx files are allowed." });
-    }
+        const name = (req.file.originalname || "").toLowerCase();
+        if (!/\.(xls|xlsx)$/.test(name)) {
+          return res.status(400).json({ error: "ONLY_XLS_OR_XLSX", requestId: rid });
+        }
 
-    // Читаем как буфер (XLS старого формата поддерживается)
-    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+        const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+        const out = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 
-    // Пишем в XLSX
-    const out = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+        const base = (req.file.originalname || "converted").replace(/\.[^.]+$/, "");
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
 
-    const base = (req.file.originalname || "converted").replace(/\.[^.]+$/, "");
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
-    return res.send(out);
-  } catch (e) {
-    console.error(e);
-    // Частая причина — битый/защищённый файл
-    return res.status(500).json({ error: "Failed to convert to XLSX. Make sure the file is a valid .xls/.xlsx." });
-  }
+        const parseMs = Date.now() - started;
+        console.log(`[convert] rid=${rid} file="${req.file.originalname}" size=${req.file.size}B parseMs=${parseMs}`);
+        return res.send(out);
+      } catch (e) {
+        console.error(`[convert][error] rid=${rid}`, e);
+        return res.status(500).json({ error: "CONVERT_FAILED", requestId: rid });
+      }
 });
 
-// === /api/statement/parse (stub) ===
-
+// === upload для /api/statement/parse: сохраняем во временный файл в /tmp
 const uploadXlsOnly = multer({
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
-  fileFilter: (req, file, cb) => {
-    const name = (file.originalname || "").toLowerCase();
-    if (!name.endsWith(".xls")) return cb(new Error("ONLY_XLS_ALLOWED"));
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, file, cb) => {
+      const base = (file.originalname || 'upload').replace(/\s+/g, '_');
+      cb(null, `${Date.now()}_${base}`);
+    }
+  }),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
+  fileFilter: (_req, file, cb) => {
+    const name = (file.originalname || '').toLowerCase();
+    if (!name.endsWith('.xls')) return cb(new Error('ONLY_XLS_ALLOWED'));
     cb(null, true);
   },
 });
@@ -141,104 +175,191 @@ function pick(row, keys) {
 
 
 
-app.post("/api/statement/parse", uploadXlsOnly.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "NO_FILE" });
+app.post('/api/statement/parse', uploadXlsOnly.single('file'), async (req, res) => {
+    const rid = req.id;
+      const started = Date.now();
 
-    const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-    const sheetName = wb.SheetNames[0];
-    const ws = wb.Sheets[sheetName];
+      // фиксированная таймзона
+      const zone = 'Asia/Bishkek';
 
-    const isDebug = String(req.query?.debug || "") === "1";
-    const HEADER_INDEX = 12; // 13-я строка
+      try {
+        if (!req.file) return res.status(400).json({ error: 'NO_FILE' });
 
-    // читаем, считая 13-ю строку заголовками
-    const rowsFixed = XLSX.utils.sheet_to_json(ws, { defval: "", range: HEADER_INDEX });
+        const filepath = req.file.path;
+        const originalName = req.file.originalname;
+        const size = req.file.size;
 
-    if (isDebug) {
-      const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
-      return res.json({
-        firstSheet: sheetName,
-        headerIndexUsed: HEADER_INDEX,
-        headerRowUsed: aoa[HEADER_INDEX] || [],
-        rowsLenFixed: rowsFixed.length,
-        sampleRowFixed: rowsFixed[0] || null,
-        previewFixed: rowsFixed.slice(0, 3),
-      });
-    }
+        // читаем файл с диска (xls/xlsx поддерживается)
+        const buf = await fs.readFile(filepath);
+          const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
+        const sheetName = wb.SheetNames[0];
+        const ws = wb.Sheets[sheetName];
 
-    // -------- боевой парсинг --------
-    const transactions = [];
-    for (const r of rowsFixed) {
-      const dateRaw = pick(r, COLS.date);
-      const dt = tryParseDate(dateRaw);
-      if (!dt) continue; // игнорируем хвост/строки без даты
+        const isDebug = String(req.query?.debug || '') === '1';
+        const HEADER_INDEX = 12; // 13-я строка — как ты и ставил
 
-      const desc = (pick(r, COLS.desc) ?? "").toString().trim();
+        const rowsFixed = XLSX.utils.sheet_to_json(ws, { defval: '', range: HEADER_INDEX });
 
-      const debitRaw = pick(r, COLS.debit);
-      const creditRaw = pick(r, COLS.credit);
-      const amountRaw = pick(r, COLS.amount);
+        if (isDebug) {
+          const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+          const parseMs = Date.now() - started;
+          return res.json({
+            meta: {
+              requestId: rid,
+              processedAt: DateTime.now().setZone(zone).toISO(),
+              parseMs
+            },
+            debug: {
+              firstSheet: sheetName,
+              headerIndexUsed: HEADER_INDEX,
+              headerRowUsed: aoa[HEADER_INDEX] || [],
+              rowsLenFixed: rowsFixed.length,
+              sampleRowFixed: rowsFixed[0] || null,
+              previewFixed: rowsFixed.slice(0, 3),
+            }
+          });
+        }
 
-      let spending = NaN;
-      if (debitRaw !== undefined && String(debitRaw).trim() !== "") {
-        spending = parseKgsNumber(debitRaw);
-      } else if (amountRaw !== undefined && String(amountRaw).trim() !== "") {
-        const a = parseKgsNumber(amountRaw);
-        const isIncome = creditRaw !== undefined && String(creditRaw).trim() !== "" && parseKgsNumber(creditRaw) > 0;
-        spending = isIncome ? 0 : (a < 0 ? Math.abs(a) : a);
+        // ---- парсинг транзакций (твоя логика с небольшими правками) ----
+          const transactions = [];
+          for (const r of rowsFixed) {
+            const dateRaw = pick(r, COLS.date);
+            const dt = tryParseDate(dateRaw);
+            if (!dt) continue;
+
+            const desc = (pick(r, COLS.desc) ?? '').toString().trim();
+              // ВНИМАНИЕ: в этом файле:
+              // creditRaw -> РАСХОД (списание)
+              // debitRaw  -> ПРИХОД (зачисление)
+              const creditRaw = pick(r, COLS.credit); // расход
+              const debitRaw  = pick(r, COLS.debit);  // приход
+
+              const expense = Number(parseKgsNumber(creditRaw)) || 0; // списание (>=0)
+              const income  = Number(parseKgsNumber(debitRaw))  || 0; // зачисление (>=0)
+
+              // если нет ни прихода, ни расхода — пропускаем строку
+                if (expense <= 0 && income <= 0) continue;
+
+                // amount по контракту: приход (+), расход (-)
+                const amount = income - expense;
+
+              transactions.push({
+                 date: ymd(dt),           // YYYY-MM-DD
+                 description: desc,
+                 amount,                  // приход > 0, расход < 0
+                 credit: income,          // зачисления (плюсом)
+                 debit:  expense,         // списания (плюсом)
+               });
+             }
+
+          // период
+          let from = null, to = null;
+          if (transactions.length) {
+            const dates = transactions.map(t => t.date).sort();
+            from = dates[0];
+            to   = dates[dates.length - 1];
+          }
+          
+          // агрегаты по дням
+          const byDay = new Map();
+          /*
+            Накапливаем по дням:
+            - credit: сумма зачислений
+            - debit : сумма списаний
+          */
+          for (const t of transactions) {
+            const cur = byDay.get(t.date) || { date: t.date, credit: 0, debit: 0 };
+            cur.credit += t.credit || 0;
+            cur.debit  += t.debit  || 0;
+            byDay.set(t.date, cur);
+          }
+          
+          // заполнение «пустых дней» нулями на периоде
+          const dailySpending = [];
+          if (from && to) {
+            let cur = DateTime.fromISO(from, { zone });
+            const end = DateTime.fromISO(to, { zone });
+            while (cur <= end) {
+              const key = cur.toISODate(); // YYYY-MM-DD
+              const v = byDay.get(key) || { date: key, credit: 0, debit: 0 };
+              dailySpending.push({
+                date: v.date,
+                credit: Number(v.credit.toFixed(2)),
+                debit : Number(v.debit.toFixed(2)),
+                net   : Number((v.credit - v.debit).toFixed(2)),
+                // сохранить старое поле amount как «расходы по модулю» (для графика)
+                amount: Number(v.debit.toFixed(2)),
+              });
+              cur = cur.plus({ days: 1 });
+            }
+          }
+          
+
+          // totals
+          const totals = (() => {
+            const credits = transactions.reduce((s, t) => s + (t.credit || 0), 0);
+            const debits  = transactions.reduce((s, t) => s + (t.debit  || 0), 0);
+            const net     = credits - debits;
+            return {
+              credits: Number(credits.toFixed(2)),  // сумма зачислений
+              debits : Number(debits.toFixed(2)),   // сумма списаний
+              net    : Number(net.toFixed(2)),      // нетто
+              expenses: Number(debits.toFixed(2)),  // совместимость со старым полем
+            };
+          })();
+
+        const parseMs = Date.now() - started;
+
+        // account.* (как просили)
+        const account = {
+          currency: 'KGS',
+          bank: 'MBank'
+        };
+
+        // meta.*
+        const meta = {
+          processedAt: DateTime.now().setZone(zone).toISO(), // ISO с +06:00
+          requestId: rid,
+          file: {
+            name: originalName,
+            size
+          },
+          sheet: sheetName,
+          rows: rowsFixed.length,
+          parseMs
+        };
+
+        // логи (консоль)
+        console.log(`[parse] rid=${rid} file="${originalName}" size=${size}B rows=${rowsFixed.length} parseMs=${parseMs}`);
+
+        return res.json({ meta, account, period: { from, to }, dailySpending, transactions, totals });
+
+      } catch (e) {
+        if (e?.message === 'ONLY_XLS_ALLOWED') {
+          return res.status(415).json({ error: 'ONLY_XLS_ALLOWED' });
+        }
+        console.error(`[parse][error] rid=${rid}`, e);
+        return res.status(500).json({ error: 'PARSE_FAILED', requestId: rid });
+      } finally {
+        // удалить временный файл
+        if (req?.file?.path) {
+          try { await fs.unlink(req.file.path); } catch {}
+        }
       }
-      if (isNaN(spending) || spending <= 0) continue;
-
-      transactions.push({
-        date: ymd(dt),
-        description: desc,
-        amount: -Math.abs(spending), // траты — отрицательные
-      });
-    }
-
-    let from = null, to = null;
-    if (transactions.length) {
-      const dates = transactions.map(t => t.date).sort();
-      from = dates[0];
-      to = dates[dates.length - 1];
-    }
-
-    const byDay = new Map();
-    for (const t of transactions) {
-      byDay.set(t.date, (byDay.get(t.date) || 0) + Math.abs(t.amount));
-    }
-    const dailySpending = Array.from(byDay.entries())
-      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-      .map(([date, amount]) => ({ date, amount: Number(amount.toFixed(2)) }));
-
-    const totals = {
-      spending: Number(transactions.reduce((acc, t) => acc + Math.abs(t.amount), 0).toFixed(2)),
-    };
-
-    return res.json({ period: { from, to }, dailySpending, transactions, totals });
-    // -------- /боевой парсинг --------
-  } catch (e) {
-    if (e?.message === "ONLY_XLS_ALLOWED") {
-      return res.status(415).json({ error: "ONLY_XLS_ALLOWED" });
-    }
-    console.error(e);
-    return res.status(500).json({ error: "PARSE_FAILED" });
-  }
 });
 
 // --- error handler для multer и наших ошибок ---
 app.use((err, req, res, next) => {
-  // наш маркер из fileFilter: строго .xls
-  if (err && err.message === "ONLY_XLS_ALLOWED") {
-    return res.status(415).json({ error: "ONLY_XLS_ALLOWED" });
-  }
-  // ошибки multer (размер, поле и т.п.)
-  if (err && err instanceof multer.MulterError) {
-    return res.status(400).json({ error: "UPLOAD_ERROR", code: err.code });
-  }
-  // прокинем дальше — на случай других ошибок
-  return next(err);
+    if (err?.message === 'ONLY_XLS_ALLOWED') {
+      return res.status(415).json({ error: 'ONLY_XLS_ALLOWED' });
+    }
+    if (err && err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'PAYLOAD_TOO_LARGE' }); // по требованию
+      }
+      return res.status(400).json({ error: 'UPLOAD_ERROR', code: err.code });
+    }
+    return next(err);
 });
 
 // 404
@@ -246,3 +367,5 @@ app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`XLS->XLSX converter listening on ${PORT}`));
+
+
