@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs/promises';
 import os from 'os';
 import helmet from 'helmet';
+import { buildCumulativeTimeline, attachDailyCumulativeClose } from './utils/cumulative.js';
 
 const app = express();
 app.use(helmet({ crossOriginResourcePolicy: false }));
@@ -125,6 +126,8 @@ const COLS = {
   amount: ['Сумма', 'Amount', 'Итого']
 };
 
+COLS.time = ['Время', 'Time', 'Время операции', 'Operation time', 'Transaction time'];
+
 function pick(row, keys) {
   const map = Object.fromEntries(Object.keys(row).map(k => [k.toLowerCase().trim(), k]));
   for (const k of keys) {
@@ -133,6 +136,117 @@ function pick(row, keys) {
   }
   return undefined;
 }
+function buildTsISO(dateRaw, timeRaw, index, zone) {
+  // Если пришёл Date — используем его как есть (может уже содержать время)
+  if (dateRaw instanceof Date && !isNaN(dateRaw)) {
+    const dt = DateTime.fromJSDate(dateRaw, { zone });
+    // если в исходном Date время=00:00:00 и есть колонка timeRaw — добавим её
+    if (
+      (dt.hour + dt.minute + dt.second === 0) &&
+      timeRaw !== undefined && timeRaw !== null && String(timeRaw).trim() !== ''
+    ) {
+      const t = normalizeTimeFromAny(timeRaw);
+      if (t) {
+        const composed = DateTime.fromISO(
+          `${dt.toFormat('yyyy-LL-dd')}T${t}`,
+          { zone }
+        );
+        return composed.isValid ? composed.toISO() : null;
+      }
+    }
+    return dt.isValid ? dt.toISO() : null;
+  }
+
+  // Если число — это может быть Excel serial (включая дробную часть = время)
+  if (typeof dateRaw === 'number') {
+    // 1899-12-30 + N дней (фракции = часы/мин/сек)
+    const base = DateTime.fromISO('1899-12-30', { zone });
+    let dt = base.plus({ days: dateRaw });
+    // если есть отдельная колонка времени — перезапишем время
+    if (timeRaw !== undefined && timeRaw !== null && String(timeRaw).trim() !== '') {
+      const t = normalizeTimeFromAny(timeRaw);
+      if (t) {
+        dt = DateTime.fromISO(`${dt.toFormat('yyyy-LL-dd')}T${t}`, { zone });
+      }
+    }
+    return dt.isValid ? dt.toISO() : null;
+  }
+
+  // Если строка — сначала пробуем форматы 'дата время' прямо в одной колонке
+  if (typeof dateRaw === 'string') {
+    const s = dateRaw.trim();
+
+    // Популярные форматы: "12.09.2025 15:15[:ss]" и ISO-подобные
+    const dtCandidates = [
+      'dd.LL.yyyy HH:mm:ss',
+      'dd.LL.yyyy HH:mm',
+      'd.L.yyyy HH:mm:ss',
+      'd.L.yyyy HH:mm',
+      'yyyy-LL-dd HH:mm:ss',
+      'yyyy-LL-dd HH:mm',
+    ];
+    for (const fmt of dtCandidates) {
+      const dt = DateTime.fromFormat(s, fmt, { zone });
+      if (dt.isValid) return dt.toISO();
+    }
+
+    // Если времени в строке нет — берём дату и пытаемся добавить timeRaw или синтез
+    const dateOnlyCandidates = [
+      'dd.LL.yyyy',
+      'd.L.yyyy',
+      'yyyy-LL-dd',
+    ];
+    for (const fmt of dateOnlyCandidates) {
+      const dOnly = DateTime.fromFormat(s, fmt, { zone });
+      if (dOnly.isValid) {
+        // отдельная колонка времени?
+        let timePart = null;
+        if (timeRaw !== undefined && timeRaw !== null && String(timeRaw).trim() !== '') {
+          timePart = normalizeTimeFromAny(timeRaw);
+        }
+        if (!timePart) {
+          const hour = 9 + (index % 9); // синтез стабильного времени 09..17
+          timePart = `${String(hour).padStart(2,'0')}:00:00`;
+        }
+        const composed = DateTime.fromISO(
+          `${dOnly.toFormat('yyyy-LL-dd')}T${timePart}`,
+          { zone }
+        );
+        return composed.isValid ? composed.toISO() : null;
+      }
+    }
+
+    // На крайний случай — попробуем нативный парсер
+    const dt = DateTime.fromJSDate(new Date(s), { zone });
+    if (dt.isValid) return dt.toISO();
+  }
+
+  // Если ничего не распознали — вернём null
+  return null;
+}
+
+// вспомогательная: нормализуем timeRaw в "HH:mm:ss"
+function normalizeTimeFromAny(timeRaw) {
+  if (typeof timeRaw === 'number') {
+    const totalSec = Math.round(timeRaw * 24 * 3600); // доля суток
+    const hh = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+    const mm = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+    const ss = String(totalSec % 60).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  } else {
+    const s = String(timeRaw).trim();
+    // "15:15" или "15:15:42"
+    const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (m) {
+      const hh = String(m[1]).padStart(2, '0');
+      const mm = String(m[2]).padStart(2, '0');
+      const ss = String(m[3] || '00').padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    }
+  }
+  return null;
+}
+
 
 // --- конвертер XLS/XLSX -> XLSX (утилита) ---
 app.post('/convert/xlsx', upload.single('file'), (req, res) => {
@@ -222,34 +336,40 @@ app.post('/api/statement/parse', uploadXlsOnly.single('file'), async (req, res) 
     }
 
     // ---- парсинг транзакций ----
-    const transactions = [];
-    for (const r of rowsFixed) {
-      const dateRaw = pick(r, COLS.date);
-      const dt = tryParseDate(dateRaw);
-      if (!dt) continue;
+      const transactions = [];
+      for (const [i, r] of rowsFixed.entries()) {
+        const dateRaw = pick(r, COLS.date);
+        const timeRaw = pick(r, COLS.time);
+        const tsISO = buildTsISO(dateRaw, timeRaw, i, zone);
+        if (!tsISO) continue;
 
-      const desc = (pick(r, COLS.desc) ?? '').toString().trim();
 
-      // Маппинг MBank: Credit => расход, Debit => приход
-      const incomeRaw = pick(r, COLS.debitIsIncomeKeys);   // приход
-      const expenseRaw = pick(r, COLS.creditIsExpenseKeys); // расход
+        // MBank: Debit => приход, Credit => расход
+        const incomeRaw = pick(r, COLS.debitIsIncomeKeys);    // приход (плюс)
+        const expenseRaw = pick(r, COLS.creditIsExpenseKeys); // расход (плюс)
 
-      const income = Number(parseKgsNumber(incomeRaw)) || 0;   // >= 0
-      const expense = Number(parseKgsNumber(expenseRaw)) || 0; // >= 0
+        const income = Number(parseKgsNumber(incomeRaw)) || 0;
+        const expense = Number(parseKgsNumber(expenseRaw)) || 0;
 
-      if (income <= 0 && expense <= 0) continue; // пустая строка
+        if (income <= 0 && expense <= 0) continue;
 
-      const amount = income - expense; // >0 приход, <0 расход
+        const amount = income - expense; // >0 приход, <0 расход
+        const tsDate = DateTime.fromISO(tsISO, { zone }).toJSDate();
+          
+          const rawDesc = (pick(r, COLS.desc) ?? '').toString();
+          const desc = rawDesc.replace(/\\\\/g, '\\').trim();
 
-      transactions.push({
-        date: ymd(dt),                 // YYYY-MM-DD
-        description: desc,
-        amount,                        // знак важен
-        credit: income,                // приход (плюс)
-        debit: expense,                // расход (плюс)
-        direction: amount < 0 ? 'debit' : 'credit'
-      });
-    }
+
+        transactions.push({
+          ts: tsISO,                       // <-- ПОЛНЫЙ ISO С ВРЕМЕНЕМ
+          date: ymd(tsDate),               // оставим для совместимости
+          description: desc,
+          amount,
+          credit: income,
+          debit: expense,
+          direction: amount < 0 ? 'debit' : 'credit'
+        });
+      }
 
     // период
     let from = null, to = null;
@@ -302,6 +422,30 @@ app.post('/api/statement/parse', uploadXlsOnly.single('file'), async (req, res) 
         spending: expenses        // обратная совместимость со старым именем
       };
     })();
+      
+      // --- cumulative timeline (по каждой транзакции) и end-of-day cumulativeClose ---
+      let timeline = [];
+      let dailyWithCum = dailySpending;
+      if ((transactions?.length || 0) > 0 && from && to) {
+        timeline = buildCumulativeTimeline(
+          transactions.map(t => ({ ts: t.ts, amount: t.amount })),  // минимально нужные поля
+          { tz: zone }
+        );
+
+        const dailyCum = attachDailyCumulativeClose(
+          { from, to },
+          transactions.map(t => ({ ts: t.ts, amount: t.amount })),
+          { tz: zone }
+        );
+
+        // примиксуем cumulativeClose в dailySpending по дате
+        const byDateCum = new Map(dailyCum.map(x => [x.date, x.cumulativeClose]));
+        dailyWithCum = dailySpending.map(d => ({
+          ...d,
+          cumulativeClose: Number((byDateCum.get(d.date) ?? 0).toFixed(2))
+        }));
+      }
+
 
     const parseMs = Date.now() - started;
 
@@ -317,11 +461,23 @@ app.post('/api/statement/parse', uploadXlsOnly.single('file'), async (req, res) 
       rows: rowsFixed.length,
       parseMs
     };
+      
+      meta.contract = {
+        timeline: { ts: 'ISO+06:00', cumulative: 'number' },
+        dailySpending: { amount: 'expensesPositive', cumulativeClose: 'eod cumulative', net: 'deprecated' }
+      };
 
     // логи (консоль)
     console.log(`[parse] rid=${rid} file="${originalName}" size=${size}B rows=${rowsFixed.length} parseMs=${parseMs}`);
 
-    return res.json({ meta, account, period: { from, to }, dailySpending, transactions, totals });
+      return res.json({
+        meta, account, period: { from, to },
+        dailySpending: dailyWithCum,   // <-- с cumulativeClose
+        transactions,
+        timeline,                      // <-- новая серия для графика ↑/↓
+        totals
+      });
+
   } catch (e) {
     if (e?.message === 'ONLY_XLS_ALLOWED') {
       return res.status(415).json({ error: 'ONLY_XLS_ALLOWED' });
@@ -355,3 +511,4 @@ app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`XLS->XLSX converter listening on ${PORT}`));
+
